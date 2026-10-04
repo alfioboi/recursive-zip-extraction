@@ -1,72 +1,83 @@
 const fs = require('fs');
 const path = require('path');
-const yauzl = require('yauzl');
+const { unzipSync } = require('fflate');
+const {createInterface} = require("node:readline");
 
 function sanitizeName(name) {
-  return name.replace(/"/g, '').replace(/:/g, '');
+    return name.replace(/"/g, '').replace(/:/g, '');
 }
 
-function unzipFile(file, target) {
-  return new Promise((resolve, reject) => {
-    yauzl.open(file, {lazyEntries: true}, (err, zipfile) => {
-      if (err) reject(err);
+async function unzipFile(file, target) {
+    await fs.promises.mkdir(target, { recursive: true });
 
-      zipfile.readEntry();
-      zipfile.on('entry', (entry) => {
-        const sanitizedFileName = sanitizeName(entry.fileName);
-        const filePath = path.join(target, sanitizedFileName);
-        if (/\/$/.test(entry.fileName)) { // Directory
-          fs.mkdir(filePath, {recursive: true}, (err) => {
-            if (err) reject(err);
-            zipfile.readEntry();
-          });
-        } else { // File
-          zipfile.openReadStream(entry, (err, readStream) => {
-            if (err) reject(err);
-            fs.mkdir(path.dirname(filePath), {recursive: true}, (err) => {
-              if (err) reject(err);
-              readStream.pipe(fs.createWriteStream(filePath));
-              readStream.on('end', () => {
-                zipfile.readEntry();
-              });
-            });
-          });
+    const data = fs.readFileSync(file);
+    const files = unzipSync(data); // fflate è tollerante, niente Z_BUF_ERROR
+
+    for (const [name, content] of Object.entries(files)) {
+        const sanitized = sanitizeName(name);
+        const filePath = path.join(target, sanitized);
+
+        if (sanitized.endsWith('/')) {
+            await fs.promises.mkdir(filePath, { recursive: true });
+        } else {
+            await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+            fs.writeFileSync(filePath, content);
         }
-      });
-
-      zipfile.once('end', () => resolve());
-    });
-  });
+    }
 }
 
 async function extractZipFiles(directory) {
-  let entries = fs.readdirSync(directory, { withFileTypes: true });
+    const entries = fs.readdirSync(directory, { withFileTypes: true });
 
-  for (let entry of entries) {
-    let fullPath = path.join(directory, entry.name);
+    for (let entry of entries) {
+        const fullPath = path.join(directory, entry.name);
 
-    if (entry.isDirectory()) {
-      await extractZipFiles(fullPath);
+        if (entry.isDirectory()) {
+            await extractZipFiles(fullPath);
+        }
+        else if (entry.isFile() && path.extname(fullPath) === '.zip') {
+            const outputDir = path.join(directory, path.basename(entry.name, '.zip'));
+
+            if (outputDir.length > 240) {
+                console.error('Path is too long, skipping file:', fullPath);
+                continue;
+            }
+
+            try {
+                await unzipFile(fullPath, outputDir);
+                fs.unlinkSync(fullPath);
+                await extractZipFiles(outputDir);
+            } catch (err) {
+                console.error('Failed to extract zip:', fullPath, 'Error:', err);
+            }
+        }
     }
-    else if (entry.isFile() && path.extname(fullPath) === '.zip') {
-      let outputDir = path.join(directory, path.basename(entry.name, '.zip'));
-
-      if (outputDir.length > 240) { // Path length check
-        console.error('Path is too long, skipping file:', fullPath);
-        continue;
-      }
-
-      try {
-        await unzipFile(fullPath, outputDir);
-        fs.unlinkSync(fullPath);
-        await extractZipFiles(outputDir);
-      }
-      catch (err) {
-        console.error('Failed to extract zip:', fullPath, 'Error:', err);
-      }
-    }
-  }
 }
+function ask(question) {
+    const rl = createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
 
-let workingDir = __dirname; // Current script directory
-extractZipFiles(workingDir);
+    return new Promise(resolve => {
+        rl.question(question, answer => {
+            rl.close();
+            resolve(answer);
+        });
+    });
+}
+async function askUserParams() {
+    const file = await ask("Percorso del file ZIP: ");
+    return { file };
+}
+function cleanPath(p) {
+    return p.trim().replace(/^"(.*)"$/, "$1");
+}
+(async () => {
+    const file = cleanPath(await ask("Percorso del file ZIP: "));
+    const target = path.join(path.dirname(file), path.basename(file, '.zip'));
+
+    await unzipFile(file, target);
+    await extractZipFiles(target);
+})();
+
